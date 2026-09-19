@@ -23,9 +23,11 @@ PLACA = Path(pattern=r"^\d{5}$", description="Placa de 5 dígitos")
 
 def _env(nombre: str) -> str:
     valor = os.environ.get(nombre)
-    if not valor:
+    if not valor or not valor.strip():
         raise RuntimeError(f"Falta la variable de entorno {nombre}")
-    return valor
+    # .strip(): evita fallos silenciosos por espacios/saltos de línea que
+    # Render (u otros paneles) a veces dejan al pegar el valor.
+    return valor.strip()
 
 
 def _solo_lectura(conn) -> None:
@@ -61,7 +63,8 @@ async def base_de_datos_no_disponible(request: Request, exc: OperationalError):
 
 def require_api_key(request: Request, x_api_key: Optional[str] = Header(default=None)) -> None:
     esperada = request.app.state.api_key
-    if not x_api_key or not secrets.compare_digest(x_api_key.encode(), esperada.encode()):
+    recibida = (x_api_key or "").strip()
+    if not recibida or not secrets.compare_digest(recibida.encode(), esperada.encode()):
         raise HTTPException(status_code=401, detail="API key inválida o ausente")
 
 
