@@ -1,184 +1,152 @@
-"""Microservicio de solo lectura del inventario de equipos y periféricos.
-
-Django --HTTP + X-API-Key--> este servicio (Render) --SQL--> Supabase (PostgreSQL)
-
-Variables de entorno obligatorias:
-  DATABASE_URL  cadena de conexión de Supabase (usar el pooler)
-  API_KEY       clave que Django debe enviar en la cabecera X-API-Key
 """
-import os
-import secrets
-from contextlib import asynccontextmanager
-from typing import Literal, Optional
+Microservicio de stock - inventario_perifericos
+================================================
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path, Request
-from fastapi.responses import JSONResponse
-from psycopg import OperationalError
-from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
+Se conecta a la base de datos en Supabase (tablas perifericos_periferico,
+perifericos_monitor, perifericos_equipo) y expone esos datos por HTTP.
 
-Estado = Literal["EN_USO", "EN_BODEGA", "EN_REPARACION", "DADO_DE_BAJA"]
-PLACA = Path(pattern=r"^\d{5}$", description="Placa de 5 dígitos")
+Encaja en el flujo del proyecto Django adjunto:
 
+    Django (views.stock_proveedor) --HTTP GET--> este microservicio --SQL--> Supabase
 
-def _env(nombre: str) -> str:
-    valor = os.environ.get(nombre)
-    if not valor or not valor.strip():
-        raise RuntimeError(f"Falta la variable de entorno {nombre}")
-    # .strip(): evita fallos silenciosos por espacios/saltos de línea que
-    # Render (u otros paneles) a veces dejan al pegar el valor.
-    return valor.strip()
+Para conectarlo con el proyecto Django:
+1. Despliega este microservicio en Render (ver README.md).
+2. En inventario/settings.py del proyecto Django, cambia:
+       MICROSERVICIO_STOCK_URL = "https://tu-servicio.onrender.com/api/stock"
+   por la URL real que te da Render.
+3. La vista `stock_proveedor` y su template ya están listos para consumir
+   el JSON que devuelve /api/stock (ver más abajo).
+"""
 
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
-def _solo_lectura(conn) -> None:
-    # Cada transacción se abre como READ ONLY: esta API nunca escribe.
-    conn.read_only = True
+from database import filas_a_diccionarios, get_connection
 
+app = FastAPI(title="Microservicio de Stock - Inventario Periféricos")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    app.state.api_key = _env("API_KEY")
-    app.state.pool = ConnectionPool(
-        _env("DATABASE_URL"),
-        min_size=1,
-        max_size=5,
-        timeout=10,
-        open=False,
-        configure=_solo_lectura,
-        # prepare_threshold=None: compatible con el pooler en modo transacción
-        kwargs={"row_factory": dict_row, "prepare_threshold": None},
-    )
-    app.state.pool.open(wait=True, timeout=30)
-    yield
-    app.state.pool.close()
+# En producción, reemplaza "*" por el dominio real donde corre tu Django
+# (ej. https://mi-django-app.onrender.com) para no exponer la API a cualquiera.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 
-app = FastAPI(title="API Inventario", version="1.0.0", lifespan=lifespan)
+@app.get("/")
+def raiz():
+    return {"status": "ok", "servicio": "microservicio-stock", "supabase": True}
 
 
-@app.exception_handler(OperationalError)
-async def base_de_datos_no_disponible(request: Request, exc: OperationalError):
-    return JSONResponse(status_code=503, content={"detail": "Base de datos no disponible"})
+@app.get("/api/perifericos")
+def listar_perifericos():
+    """Mouse y teclados: tabla perifericos_periferico."""
+    query = """
+        select id, tipo, conexion, marca, cantidad
+        from perifericos_periferico
+        order by tipo, conexion
+    """
+    try:
+        with get_connection() as conn, conn.cursor() as cur:
+            cur.execute(query)
+            return filas_a_diccionarios(cur)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error consultando Supabase: {exc}")
 
 
-def require_api_key(request: Request, x_api_key: Optional[str] = Header(default=None)) -> None:
-    esperada = request.app.state.api_key
-    recibida = (x_api_key or "").strip()
-    if not recibida or not secrets.compare_digest(recibida.encode(), esperada.encode()):
-        raise HTTPException(status_code=401, detail="API key inválida o ausente")
-
-
-def consultar(request: Request, sql: str, params: tuple = ()) -> list[dict]:
-    with request.app.state.pool.connection() as conn:
-        return conn.execute(sql, params).fetchall()
-
-
-def uno_o_404(filas: list[dict], mensaje: str) -> dict:
-    if not filas:
-        raise HTTPException(status_code=404, detail=mensaje)
-    return filas[0]
-
-
-@app.get("/health", tags=["sistema"])
-def health(request: Request):
-    consultar(request, "select 1")
-    return {"status": "ok"}
-
-
-router = APIRouter(prefix="/api", dependencies=[Depends(require_api_key)])
-
-
-@router.get("/resumen", tags=["inventario"])
-def resumen(request: Request):
-    """Conteos generales (equivale a la vista index de Django)."""
-    return uno_o_404(
-        consultar(
-            request,
-            """
-            select
-              (select count(*) from public.perifericos)                  as total_perifericos,
-              (select coalesce(sum(cantidad), 0) from public.perifericos) as unidades_perifericos,
-              (select count(*) from public.monitores)                    as total_monitores,
-              (select count(*) from public.equipos)                      as total_equipos
-            """,
-        ),
-        "Sin datos",
-    )
-
-
-@router.get("/stock", tags=["inventario"])
-def stock(request: Request, categoria: Optional[Literal["PERIFERICO", "EQUIPO", "MONITOR"]] = None):
-    """Resumen total / asignados / disponibles por categoría (endpoint de stock_proveedor)."""
-    return consultar(
-        request,
-        """
-        select * from public.v_stock_resumen
-        where (%s::text is null or categoria = %s)
-        order by categoria, tipo, detalle, marca
-        """,
-        (categoria, categoria),
-    )
-
-
-@router.get("/equipos", tags=["equipos"])
-def listar_equipos(
-    request: Request,
-    tipo: Optional[Literal["PORTATIL", "ESCRITORIO"]] = None,
-    estado: Optional[Estado] = None,
-):
-    return consultar(
-        request,
-        """
-        select * from public.v_equipos
-        where (%s::text is null or tipo = %s)
-          and (%s::text is null or estado = %s)
+@app.get("/api/monitores")
+def listar_monitores():
+    """Tabla perifericos_monitor."""
+    query = """
+        select id, placa, marca, pulgadas
+        from perifericos_monitor
         order by placa
-        """,
-        (tipo, tipo, estado, estado),
-    )
+    """
+    try:
+        with get_connection() as conn, conn.cursor() as cur:
+            cur.execute(query)
+            return filas_a_diccionarios(cur)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error consultando Supabase: {exc}")
 
 
-@router.get("/equipos/{placa}", tags=["equipos"])
-def detalle_equipo(request: Request, placa: str = PLACA):
-    filas = consultar(request, "select * from public.v_equipos where placa = %s", (placa,))
-    return uno_o_404(filas, f"No existe un equipo con placa {placa}")
-
-
-@router.get("/monitores", tags=["monitores"])
-def listar_monitores(request: Request, estado: Optional[Estado] = None):
-    return consultar(
-        request,
-        """
-        select * from public.v_monitores
-        where (%s::text is null or estado = %s)
+@app.get("/api/equipos")
+def listar_equipos():
+    """Tabla perifericos_equipo."""
+    query = """
+        select id, placa, tipo, marca, usuario_asignado
+        from perifericos_equipo
         order by placa
-        """,
-        (estado, estado),
-    )
+    """
+    try:
+        with get_connection() as conn, conn.cursor() as cur:
+            cur.execute(query)
+            return filas_a_diccionarios(cur)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error consultando Supabase: {exc}")
 
 
-@router.get("/monitores/{placa}", tags=["monitores"])
-def detalle_monitor(request: Request, placa: str = PLACA):
-    filas = consultar(request, "select * from public.v_monitores where placa = %s", (placa,))
-    return uno_o_404(filas, f"No existe un monitor con placa {placa}")
+@app.get("/api/stock")
+def stock_general():
+    """
+    Endpoint que consume directamente la vista `stock_proveedor` de Django
+    (MICROSERVICIO_STOCK_URL). Combina las tres tablas en una sola lista,
+    describiendo cada ítem y su cantidad en stock.
+    """
+    items = []
+    try:
+        with get_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select tipo, conexion, marca, cantidad
+                from perifericos_periferico
+                order by tipo, conexion
+                """
+            )
+            for tipo, conexion, marca, cantidad in cur.fetchall():
+                items.append(
+                    {
+                        "categoria": "periferico",
+                        "producto": f"{tipo.title()} {conexion.title()} - {marca}",
+                        "stock": cantidad,
+                    }
+                )
 
+            cur.execute(
+                """
+                select placa, marca, pulgadas
+                from perifericos_monitor
+                order by placa
+                """
+            )
+            for placa, marca, pulgadas in cur.fetchall():
+                items.append(
+                    {
+                        "categoria": "monitor",
+                        "producto": f"Monitor {placa} - {marca} ({pulgadas}\")",
+                        "stock": 1,
+                    }
+                )
 
-@router.get("/perifericos", tags=["perifericos"])
-def listar_perifericos(request: Request):
-    return consultar(
-        request,
-        "select * from public.v_stock_perifericos order by tipo, conexion, marca",
-    )
+            cur.execute(
+                """
+                select placa, tipo, marca, usuario_asignado
+                from perifericos_equipo
+                order by placa
+                """
+            )
+            for placa, tipo, marca, usuario in cur.fetchall():
+                asignado = f" - {usuario}" if usuario else " - sin asignar"
+                items.append(
+                    {
+                        "categoria": "equipo",
+                        "producto": f"{tipo.title()} {placa} - {marca}{asignado}",
+                        "stock": 1,
+                    }
+                )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error consultando Supabase: {exc}")
 
-
-@router.get("/perifericos/{periferico_id}", tags=["perifericos"])
-def detalle_periferico(request: Request, periferico_id: int):
-    filas = consultar(
-        request,
-        "select * from public.v_stock_perifericos where periferico_id = %s",
-        (periferico_id,),
-    )
-    return uno_o_404(filas, f"No existe el periférico {periferico_id}")
-
-
-app.include_router(router)
+    return items

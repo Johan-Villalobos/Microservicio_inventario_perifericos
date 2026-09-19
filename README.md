@@ -1,59 +1,75 @@
-# API Inventario (FastAPI + Supabase)
+# Microservicio de stock (Supabase → Render → Django)
 
-Microservicio **de solo lectura** que expone el inventario de equipos, monitores y
-periféricos guardado en Supabase. Lo consume la app Django.
+API en FastAPI que consulta directamente las tablas de Supabase creadas con
+`supabase_migration.sql` (`perifericos_periferico`, `perifericos_monitor`,
+`perifericos_equipo`) y las expone por HTTP para que el proyecto Django
+`inventario_perifericos` las consuma desde su vista `stock_proveedor`.
 
 ```
-Django --HTTP + X-API-Key--> Render (este servicio) --SQL--> Supabase
+Django (views.stock_proveedor) --HTTP GET--> este microservicio --SQL--> Supabase
 ```
 
 ## Endpoints
 
-Todos (menos `/health`) requieren la cabecera `X-API-Key`.
+| Ruta | Descripción |
+|---|---|
+| `GET /` | Healthcheck |
+| `GET /api/perifericos` | Mouse y teclados tal cual en la tabla `perifericos_periferico` |
+| `GET /api/monitores` | Tabla `perifericos_monitor` |
+| `GET /api/equipos` | Tabla `perifericos_equipo` |
+| `GET /api/stock` | Combinación de las tres tablas, con la forma `{"categoria", "producto", "stock"}` — **este es el endpoint que debe usar `MICROSERVICIO_STOCK_URL`** |
 
-| Método | Ruta | Devuelve |
-|---|---|---|
-| GET | `/health` | Estado del servicio y de la conexión a la BD (sin API key) |
-| GET | `/api/resumen` | Conteos generales (equivale al `index` de Django) |
-| GET | `/api/stock?categoria=` | Total / asignados / disponibles (`PERIFERICO`, `EQUIPO`, `MONITOR`). Es la ruta para `stock_proveedor` |
-| GET | `/api/equipos?tipo=&estado=` | Lista de equipos |
-| GET | `/api/equipos/{placa}` | Detalle por placa de 5 dígitos |
-| GET | `/api/monitores?estado=` | Lista de monitores |
-| GET | `/api/monitores/{placa}` | Detalle por placa de 5 dígitos |
-| GET | `/api/perifericos` | Mouse y teclados con total, asignados y disponibles |
-| GET | `/api/perifericos/{id}` | Detalle de un periférico |
-
-Documentación interactiva en `/docs`.
-
-## Prueba local
+## Probar en local
 
 ```bash
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+python -m venv .venv
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-export DATABASE_URL="postgresql://..."   # Windows PowerShell: $env:DATABASE_URL="..."
-export API_KEY="una-clave-de-prueba"
+cp .env.example .env
+# edita .env con tu cadena real de Supabase
 
+export $(cat .env | xargs)     # o usa python-dotenv / tu shell habitual
 uvicorn main:app --reload
-curl -H "X-API-Key: una-clave-de-prueba" http://127.0.0.1:8000/api/stock
 ```
 
-## Despliegue en Render
+Luego visita `http://127.0.0.1:8000/api/stock`.
 
-1. Sube esta carpeta a un repositorio de GitHub.
-2. En Render: **New > Blueprint** (usa `render.yaml`) o **New > Web Service** con:
-   - Build: `pip install -r requirements.txt`
-   - Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-   - Health check path: `/health`
-3. En **Environment** define `DATABASE_URL` y `API_KEY`.
-4. Con la URL pública, en Django: `MICROSERVICIO_STOCK_URL = "https://<tu-servicio>.onrender.com/api/stock"`
-   y enviar la cabecera `X-API-Key` en el `requests.get(...)`.
+## Desplegar en Render
+
+1. Sube esta carpeta (`microservicio_stock/`) a un repo de GitHub.
+2. En Render: **New +** → **Web Service** → conecta el repo.
+3. Render detecta el `Procfile`, pero confirma:
+   - **Build Command:** `pip install -r requirements.txt`
+   - **Start Command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
+4. En **Environment**, agrega la variable `DATABASE_URL` con la cadena de
+   conexión de Supabase (usa el modo *Connection pooling*, puerto `6543`,
+   para que Render no agote las conexiones directas de Supabase).
+5. Deploy. Render te da una URL tipo `https://microservicio-stock.onrender.com`.
+
+## Conectarlo con el proyecto Django adjunto
+
+En `inventario_perifericos/inventario/settings.py`, cambia:
+
+```python
+MICROSERVICIO_STOCK_URL = "https://tu-microservicio.onrender.com/api/stock"
+```
+
+por la URL real que te dio Render, por ejemplo:
+
+```python
+MICROSERVICIO_STOCK_URL = "https://microservicio-stock.onrender.com/api/stock"
+```
+
+Con eso, al entrar a `/perifericos/stock-proveedor/` en el proyecto Django,
+la vista `stock_proveedor` (en `perifericos/views.py`) le hará un `GET` a
+este microservicio y renderizará la lista que devuelve `/api/stock` en
+`stock_proveedor.html`, sin que Django toque SQLite ni Supabase directamente.
 
 ## Notas
 
-- Usa la cadena del **Session pooler** de Supabase (soporta IPv4). La conexión directa
-  de Supabase es solo IPv6 y puede fallar desde Render.
-- Cada transacción se abre en modo `READ ONLY`: aunque alguien llegue a la API,
-  esta no puede modificar datos.
-- En el plan gratuito de Render el servicio se duerme tras inactividad y la primera
-  petición puede tardar de 30 a 60 segundos.
+- El microservicio es de **solo lectura** (solo `SELECT`). Si luego quieres
+  registrar movimientos de stock desde Django hacia Supabase, se agregan
+  endpoints `POST`/`PUT` aquí siguiendo el mismo patrón.
+- CORS está abierto (`allow_origins=["*"]`) para simplificar las pruebas;
+  en producción restringe `allow_origins` al dominio donde corra tu Django.
