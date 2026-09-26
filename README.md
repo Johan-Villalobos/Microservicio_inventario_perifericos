@@ -11,13 +11,26 @@ Django (views.stock_proveedor) --HTTP GET--> este microservicio --SQL--> Supabas
 
 ## Endpoints
 
-| Ruta | Descripción |
-|---|---|
-| `GET /` | Healthcheck |
-| `GET /api/perifericos` | Mouse y teclados tal cual en la tabla `perifericos_periferico` |
-| `GET /api/monitores` | Tabla `perifericos_monitor` |
-| `GET /api/equipos` | Tabla `perifericos_equipo` |
-| `GET /api/stock` | Combinación de las tres tablas, con la forma `{"categoria", "producto", "stock"}` — **este es el endpoint que debe usar `MICROSERVICIO_STOCK_URL`** |
+| Ruta | Método | Descripción |
+|---|---|---|
+| `GET /` | GET | Healthcheck |
+| `GET /api/perifericos` | GET | Mouse y teclados tal cual en la tabla `perifericos_periferico` |
+| `POST /api/perifericos` | POST | Crea un mouse/teclado. Body: `{tipo, conexion, marca, cantidad}` |
+| `PUT /api/perifericos/{id}` | PUT | Actualiza un mouse/teclado por `id`. Mismo body que crear |
+| `DELETE /api/perifericos/{id}` | DELETE | Elimina un mouse/teclado por `id` |
+| `GET /api/monitores` | GET | Tabla `perifericos_monitor` |
+| `POST /api/monitores` | POST | Crea un monitor. Body: `{placa, marca, pulgadas}` |
+| `PUT /api/monitores/{placa}` | PUT | Actualiza un monitor por `placa`. Body: `{marca, pulgadas}` |
+| `DELETE /api/monitores/{placa}` | DELETE | Elimina un monitor por `placa` |
+| `GET /api/equipos` | GET | Tabla `perifericos_equipo` |
+| `POST /api/equipos` | POST | Crea un equipo. Body: `{placa, tipo, marca, usuario_asignado}` |
+| `PUT /api/equipos/{placa}` | PUT | Actualiza un equipo por `placa`. Body: `{tipo, marca, usuario_asignado}` |
+| `DELETE /api/equipos/{placa}` | DELETE | Elimina un equipo por `placa` |
+| `GET /api/stock` | GET | Combinación de las tres tablas, con la forma `{"categoria", "producto", "stock"}` — **este es el endpoint que debe usar `MICROSERVICIO_STOCK_URL`** |
+
+Los endpoints `POST`/`PUT` en `/api/monitores` y `/api/equipos` devuelven **409**
+si la `placa` ya existe (viola la restricción `unique` de Supabase). Los `PUT`/`DELETE`
+sobre un registro que no existe devuelven **404**.
 
 ## Probar en local
 
@@ -68,8 +81,9 @@ este microservicio y renderizará la lista que devuelve `/api/stock` en
 
 ## Notas
 
-- El microservicio es de **solo lectura** (solo `SELECT`). Si luego quieres
-  registrar movimientos de stock desde Django hacia Supabase, se agregan
-  endpoints `POST`/`PUT` aquí siguiendo el mismo patrón.
-- CORS está abierto (`allow_origins=["*"]`) para simplificar las pruebas;
-  en producción restringe `allow_origins` al dominio donde corra tu Django.
+- El microservicio ahora soporta operaciones de escritura (`POST`/`PUT`/`DELETE`)
+  además de las de solo lectura, para las tres tablas (periféricos, monitores,
+  equipos), siguiendo el mismo patrón de conexión a Supabase.
+- CORS está abierto (`allow_origins=["*"]`, y ahora también permite los métodos
+  `POST`, `PUT`, `DELETE`) para simplificar las pruebas; en producción restringe
+  `allow_origins` al dominio donde corra tu Django.
